@@ -20,7 +20,7 @@ from google.auth.transport.requests import Request
 PROJECT_ID = "gestureid"
 LOCATION = "europe-west4"
 TARGET_SIZE = 512
-MODEL_NAME = "gemini-2.5-pro"  # Se puede dejar fijo
+MODEL_NAME = "gemini-2.5-pro"
 
 SYSTEM_PROMPT = (
     "Eres un sistema que reconoce un único gesto estático de ASL. Responde sólo con A-Z, SPACE, DEL o NOTHING."
@@ -97,7 +97,7 @@ def call_vertex(png_bytes: bytes) -> Optional[str]:
             print("[Vertex] HTTP", r.status_code, r.text[:200])
             return None
         data = r.json()
-        # Ruta típica: candidates[0].content.parts[0].text
+        
         cands = data.get("candidates")
         if isinstance(cands, list) and cands:
             c0 = cands[0]
@@ -106,7 +106,7 @@ def call_vertex(png_bytes: bytes) -> Optional[str]:
             if isinstance(parts, list) and parts:
                 txt = parts[0].get("text") if isinstance(parts[0], dict) else None
                 return normalize_gesture(txt)
-        # fallback dump
+
         return normalize_gesture(json.dumps(data)[:30])
     except Exception as e:
         print("[Vertex] error:", e)
@@ -154,10 +154,10 @@ class SimpleGestureLoginApp:
         tk.Button(btns, text="Capturar (ESPACIO)", width=18, command=self.capture).pack(side=tk.LEFT, padx=6)
         tk.Button(btns, text="Borrar", width=10, command=lambda: self.sequence_var.set(""))
         tk.Button(btns, text="Borrar", width=10, command=lambda: self.sequence_var.set(""))
-        # Remove duplicate button by only packing once
+
         btns.pack_forget()
         btns.pack(pady=6)
-        # Re-add buttons cleanly
+
         for w in list(btns.winfo_children()):
             w.destroy()
         tk.Button(btns, text="Capturar (ESPACIO)", width=18, command=self.capture).pack(side=tk.LEFT, padx=6)
@@ -229,12 +229,12 @@ class SimpleGestureLoginApp:
         threading.Thread(target=self._infer_thread, args=(png_bytes,), daemon=True).start()
 
     def _infer_thread(self, png_bytes: bytes):
-        # Intentar Vertex, si falla usamos stub local
+        # Intentamos usar Vertex AI
         pred = call_vertex(png_bytes)
         if pred is None:
             pred = dummy_local_predict()
         if pred == 'NOTHING':
-            pass  # no agrega
+            pass  # no añade nada
         else:
             current = self.sequence_var.get()
             self.sequence_var.set(current + pred)
@@ -266,4 +266,5 @@ class SimpleGestureLoginApp:
 if __name__ == "__main__":
     root = tk.Tk()
     app = SimpleGestureLoginApp(root)
+
     root.mainloop()
