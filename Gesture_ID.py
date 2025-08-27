@@ -1,7 +1,6 @@
 import base64
 import io
 import json
-import os
 import threading
 import time
 from typing import Optional
@@ -29,11 +28,14 @@ PROMPT = (
     "SPACE, DEL y NOTHING. IMPORTANTE: responde únicamente con las letras A-Z o los tokens SPACE, DEL, NOTHING."
 )
 
+SIMPLE_PROMPT = (
+    "Eres un sistema experto en gestos del American Sign Language (ASL). Devuelve SOLO un token exacto: A-Z o SPACE o DEL o NOTHING. Nada más."
+)
+
 ACCENT = "#4CAF50"
 
 
 def letterbox_to_512_from_bgr(frame: np.ndarray, target: int = TARGET_SIZE) -> Image.Image:
-    """Redimensiona con letterbox a 512x512 como en Gesture_ID.py."""
     h, w = frame.shape[:2]
     scale = min(target / w, target / h)
     new_w, new_h = int(w * scale), int(h * scale)
@@ -41,7 +43,7 @@ def letterbox_to_512_from_bgr(frame: np.ndarray, target: int = TARGET_SIZE) -> I
     canvas = np.zeros((target, target, 3), dtype=np.uint8)
     x = (target - new_w) // 2
     y = (target - new_h) // 2
-    canvas[y:y+new_h, x:x+new_w] = resized
+    canvas[y:y + new_h, x:x + new_w] = resized
     rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
     return Image.fromarray(rgb)
 
@@ -62,18 +64,19 @@ def get_access_token_adc() -> Optional[str]:
         print("ADC token error:", e)
         return None
 
+
 def extract_text_from_known_paths(parsed):
     try:
         if not isinstance(parsed, dict):
             return None
         candidates = parsed.get("candidates")
-        if isinstance(candidates, list) and len(candidates) > 0:
+        if isinstance(candidates, list) and candidates:
             first_c = candidates[0]
             if isinstance(first_c, dict):
                 content = first_c.get("content")
                 if isinstance(content, dict):
                     parts = content.get("parts")
-                    if isinstance(parts, list) and len(parts) > 0:
+                    if isinstance(parts, list) and parts:
                         first_part = parts[0]
                         if isinstance(first_part, dict) and "text" in first_part:
                             t = first_part.get("text")
@@ -82,7 +85,8 @@ def extract_text_from_known_paths(parsed):
     except Exception:
         pass
     return None
-    
+
+
 def find_first_string_in_json(el):
     if el is None:
         return None
@@ -111,16 +115,8 @@ def find_first_string_in_json(el):
             return el
     return None
 
-def normalize_gesture(raw: Optional[str]) -> str:
-    """Extrae un token permitido de una respuesta libre del modelo.
 
-    Reglas:
-    1. Prioriza tokens exactos SPACE / DEL / NOTHING.
-    2. Detecta patrones 'letter is X', 'letra: X', 'sign: X'.
-    3. Una única letra aislada en el texto -> devuelve.
-    4. Si todas las letras (hasta 4) son iguales -> devuelve esa letra.
-    5. Fallback: última letra tras 'IS'.
-    """
+def normalize_gesture(raw: Optional[str]) -> str:
     if raw is None:
         return "NOTHING"
     s_full = raw.strip()
@@ -155,8 +151,8 @@ def normalize_gesture(raw: Optional[str]) -> str:
             return c
     return "NOTHING"
 
-def call_vertex_generate(png_bytes: bytes) -> Optional[str]:
-    """Llama al modelo Gemini (Vertex) y devuelve token normalizado."""
+
+def call_vertex_generate(png_bytes: bytes, model_name: Optional[str] = None, system_prompt: str = PROMPT) -> Optional[str]:
     token = get_access_token_adc()
     if not token:
         print("No ADC token")
@@ -165,8 +161,7 @@ def call_vertex_generate(png_bytes: bytes) -> Optional[str]:
     user_image_part = {"inlineData": {"mimeType": "image/png", "data": b64}}
     user_text_part = {"text": "Identifica el gesto de la imagen."}
     parts = [user_image_part, user_text_part]
-    content_wrapper = {"role": "user", "parts": parts}
-    contents = [content_wrapper]
+    contents = [{"role": "user", "parts": parts}]
     body = {
         "contents": contents,
         "generationConfig": {
@@ -175,9 +170,13 @@ def call_vertex_generate(png_bytes: bytes) -> Optional[str]:
             "candidateCount": 1,
             "maxOutputTokens": 4096,
         },
-        "systemInstruction": {"parts": [{"text": PROMPT}]},
+    "systemInstruction": {"parts": [{"text": system_prompt}]},
     }
-    url = f"https://{LOCATION}-aiplatform.googleapis.com/v1/projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/{MODEL_NAME}:generateContent"
+    mdl = model_name or MODEL_NAME
+    url = (
+        f"https://{LOCATION}-aiplatform.googleapis.com/v1/projects/{PROJECT_ID}/locations/"
+        f"{LOCATION}/publishers/google/models/{mdl}:generateContent"
+    )
     headers = {"Authorization": f"Bearer {token}"}
     try:
         resp = requests.post(url, headers=headers, json=body, timeout=60)
@@ -209,33 +208,31 @@ def call_local_model(pil_img: Image.Image) -> Optional[str]:
 
 
 class GestureLoginApp:
-    """Versión simplificada: dos modos (Gestos/Contraseña), cámara y predicción."""
     def __init__(self, root: tk.Tk):
         self.root = root
-        root.title("GestureID")
+        self.root.title("GestureID")
         try:
-            root.attributes('-fullscreen', True)
-            root.bind('<Escape>', lambda e: root.attributes('-fullscreen', False))
+            self.root.attributes('-fullscreen', True)
+            self.root.bind('<Escape>', lambda e: self.root.attributes('-fullscreen', False))
         except Exception:
             try:
-                root.state('zoomed')
+                self.root.state('zoomed')
             except Exception:
-                root.geometry('1200x800')
-        root.minsize(900, 600)
-        root.configure(bg="#f0f2f5")
+                self.root.geometry('1200x800')
+        self.root.minsize(900, 600)
+        self.root.configure(bg="#f0f2f5")
 
-        # Estado
-        self.cap = None
+        self.cap: Optional[cv2.VideoCapture] = None
         self.frame = None
         self.running = False
         self.mode = 'GESTOS'
 
-        # Vars
         self.username_var = tk.StringVar()
         self.password_var = tk.StringVar()
         self.last_pred_var = tk.StringVar(value='-')
+        self.dev_mode = False
+        self.selected_model = MODEL_NAME
 
-        # Tamaños
         self.cam_size = (800, 600)
 
         self.build_ui()
@@ -245,59 +242,77 @@ class GestureLoginApp:
             self.username_entry.focus_set()
         except Exception:
             pass
-    
-    # ---------------- UI -----------------
 
     def build_ui(self):
-        tk.Label(self.root, text="GestureID", font=("Helvetica", 28, 'bold'), bg=self.root.cget('bg')).pack(pady=(12,6))
-
+        tk.Label(self.root, text="GestureID", font=("Helvetica", 28, 'bold'), bg=self.root.cget('bg')).pack(pady=(12, 6))
         self.container = tk.Frame(self.root, bg=self.root.cget('bg'))
         self.container.pack(fill=tk.BOTH, expand=True, padx=20, pady=8)
         for i in range(3):
             self.container.grid_columnconfigure(i, weight=1)
 
-        # Card
         self.card = tk.Frame(self.container, bg='white', bd=1, relief='groove', width=420, height=300)
         self.card.grid_propagate(False)
-        self.card.grid(row=0, column=1, sticky='n', padx=6, pady=(10,0))
+        self.card.grid(row=0, column=1, sticky='n', padx=6, pady=(10, 0))
 
-        ttk.Label(self.card, text='Usuario:', font=('Arial',12)).pack(anchor='w', padx=12, pady=(10,0))
+        ttk.Label(self.card, text='Usuario:', font=('Arial', 12)).pack(anchor='w', padx=12, pady=(10, 0))
         self.username_entry = ttk.Entry(self.card, textvariable=self.username_var, width=34)
-        self.username_entry.pack(padx=12, pady=(6,8))
-        self.pass_label = ttk.Label(self.card, text='Contraseña gestual:', font=('Arial',12))
-        self.pass_label.pack(anchor='w', padx=12, pady=(2,0))
+        self.username_entry.pack(padx=12, pady=(6, 8))
+        self.pass_label = ttk.Label(self.card, text='Contraseña gestual:', font=('Arial', 12))
+        self.pass_label.pack(anchor='w', padx=12, pady=(2, 0))
         self.password_entry = ttk.Entry(self.card, textvariable=self.password_var, width=34, show='*', state='readonly')
-        self.password_entry.pack(padx=12, pady=(6,8))
+        self.password_entry.pack(padx=12, pady=(6, 8))
 
         mode_row = tk.Frame(self.card, bg='white')
-        mode_row.pack(pady=(4,4))
+        mode_row.pack(pady=(4, 4))
         self.gesture_btn = tk.Button(mode_row, text='Gestos', width=12, command=lambda: self.set_mode('GESTOS'))
         self.pass_btn = tk.Button(mode_row, text='Contraseña', width=12, command=lambda: self.set_mode('CONTRASEÑA'))
         self.gesture_btn.pack(side=tk.LEFT, padx=6)
         self.pass_btn.pack(side=tk.LEFT, padx=6)
 
         actions = tk.Frame(self.card, bg='white')
-        actions.pack(pady=(4,4))
+        actions.pack(pady=(4, 4))
         self.capture_btn = tk.Button(actions, text='Capturar (Espacio)', command=self.capture)
-        self.capture_btn.pack(side=tk.LEFT, padx=(0,8))
+        self.capture_btn.pack(side=tk.LEFT, padx=(0, 8))
         tk.Button(actions, text='Login', command=self.login).pack(side=tk.LEFT, padx=4)
         tk.Button(actions, text='Salir', command=self.quit).pack(side=tk.LEFT, padx=4)
 
-        pred_frame = tk.Frame(self.card, bg='white')
-        pred_frame.pack(pady=(6,4))
-        tk.Label(pred_frame, text='Último gesto:', bg='white').pack(side=tk.LEFT)
-        tk.Label(pred_frame, textvariable=self.last_pred_var, bg='white', font=('Arial',14,'bold')).pack(side=tk.LEFT, padx=6)
+        self.right_col = tk.Frame(self.container, bg=self.root.cget('bg'))
+        self.right_col.grid(row=0, column=2, rowspan=2, sticky='n', padx=(12, 20), pady=10)
 
-        # Cámara
-        self.webcam_holder = tk.Frame(self.container, width=self.cam_size[0], height=self.cam_size[1], bg='#000')
-        self.webcam_holder.grid(row=0, column=2, sticky='n', padx=(12,20), pady=10)
+        self.webcam_holder = tk.Frame(self.right_col, width=self.cam_size[0], height=self.cam_size[1], bg='#000')
         self.webcam_holder.pack_propagate(False)
-        self.webcam_label = tk.Label(self.webcam_holder, text='NO CAM', fg='white', bg='#000', font=('Helvetica',14))
+        self.webcam_holder.pack(side=tk.TOP)
+        self.webcam_label = tk.Label(self.webcam_holder, text='NO CAM', fg='white', bg='#000', font=('Helvetica', 14))
         self.webcam_label.pack(fill=tk.BOTH, expand=True)
+
+        self.preview_holder = tk.Frame(self.right_col, width=self.cam_size[0], height=self.cam_size[1], bg='#222')
+        self.preview_holder.pack_propagate(False)
+        self.preview_label = tk.Label(self.preview_holder, text='Sin captura', fg='white', bg='#222')
+        self.preview_label.place(relx=0.5, rely=0.5, anchor='center')
+
+        self.dev_toggle_btn = tk.Button(self.root, text='DEV Mode', width=12, command=self.toggle_dev_mode)
+        self.dev_toggle_btn.place(relx=0.01, rely=0.98, anchor='sw')
+
+        self.dev_card = tk.Frame(self.container, bg='white', bd=1, relief='groove', width=420, height=200)
+        self.dev_card.grid_propagate(False)
+        ttk.Label(self.dev_card, text='Dev Tools', font=('Arial', 10, 'bold')).pack(anchor='w', padx=8, pady=(6, 0))
+        pred_row = ttk.Frame(self.dev_card)
+        pred_row.pack(padx=8, pady=(6, 4), fill=tk.X)
+        ttk.Label(pred_row, text='Último gesto:').pack(side=tk.LEFT)
+        self.dev_pred_label = ttk.Label(pred_row, textvariable=self.last_pred_var, font=('Arial', 12, 'bold'))
+        self.dev_pred_label.pack(side=tk.LEFT, padx=6)
+        ttk.Label(self.dev_card, text='Modelo:', font=('Arial', 10)).pack(anchor='w', padx=8)
+        self.model_buttons = {}
+        models_row = ttk.Frame(self.dev_card)
+        models_row.pack(padx=8, pady=(4, 6))
+        for key in ["gemini-2.5-pro", "gemini-2.5-pro-simple", "gemini-2.5-flash", "local"]:
+            b = tk.Button(models_row, text=key.split('-')[-1], width=12, command=lambda k=key: self.select_model(k))
+            b.pack(side=tk.LEFT, padx=4)
+            self.model_buttons[key] = b
+        self._refresh_model_buttons()
 
         self._style_mode_buttons()
         self._refresh_mode_buttons()
-
 
     def _style_mode_buttons(self):
         for btn in (self.gesture_btn, self.pass_btn):
@@ -319,53 +334,64 @@ class GestureLoginApp:
             self.gesture_btn.config(**idle)
             self.password_entry.configure(state='normal')
             self.pass_label.config(text='Contraseña:')
-    
+
     def set_mode(self, mode: str):
-        if mode not in ('GESTOS','CONTRASEÑA'):
+        if mode not in ('GESTOS', 'CONTRASEÑA'):
             return
         if self.mode == mode:
             return
         self.mode = mode
-        # limpiar contraseña al cambiar
-        try: self.password_var.set('')
-        except Exception: pass
+        try:
+            self.password_var.set('')
+        except Exception:
+            pass
         if mode == 'CONTRASEÑA':
-            # permitir escritura manual y parar cámara
-            self.password_entry.configure(state='normal')
             try:
-                self.webcam_holder.grid_remove()
+                self.card.grid_configure(column=0, columnspan=3)
             except Exception:
                 pass
+            try:
+                self.right_col.grid_remove()
+            except Exception:
+                pass
+            self.password_entry.configure(state='normal')
             self.stop_camera()
             try:
                 self.capture_btn.config(state='disabled')
             except Exception:
                 pass
-        else:
-            # modo gestos: activar cámara y ocultar edición directa
-            self.password_entry.configure(state='readonly')
+            if self.dev_mode:
+                self.toggle_dev_mode(force=False)
             try:
-                self.webcam_holder.grid()
+                self.dev_toggle_btn.place_forget()
             except Exception:
                 pass
+        else:
+            try:
+                self.card.grid_configure(column=1, columnspan=1)
+            except Exception:
+                pass
+            try:
+                self.right_col.grid()
+            except Exception:
+                pass
+            self.password_entry.configure(state='readonly')
             if not self.running:
                 self.start_camera()
             try:
                 self.capture_btn.config(state='normal')
             except Exception:
                 pass
+            try:
+                self.dev_toggle_btn.place(relx=0.01, rely=0.98, anchor='sw')
+            except Exception:
+                pass
         self._refresh_mode_buttons()
-
-
-    # ------ Captura de Gestos ------
 
     def _on_space(self, event=None):
         if self.mode == 'GESTOS':
-            # Consumimos la barra espaciadora sólo en modo gestos
             self.capture()
-            return 'break'  
-        
-        # En modo contraseña dejamos que la pulsación se procese normalmente
+            return 'break'
         return None
 
     def _bind_space(self):
@@ -374,23 +400,21 @@ class GestureLoginApp:
         except Exception:
             pass
 
-    # (Se eliminaron definiciones duplicadas de set_mode/_refresh_mode)
-
-    # ---------------- Cámara & Captura -----------------
     def start_camera(self):
         if self.cap is None:
-            attempts = [(0, cv2.CAP_MSMF),(0, cv2.CAP_DSHOW),(0, cv2.CAP_VFW),(0, cv2.CAP_ANY),(1, cv2.CAP_ANY),(0,0)]
+            attempts = [(0, cv2.CAP_MSMF), (0, cv2.CAP_DSHOW), (0, cv2.CAP_VFW), (0, cv2.CAP_ANY), (1, cv2.CAP_ANY), (0, 0)]
             for idx, backend in attempts:
                 try:
                     cap = cv2.VideoCapture(idx, backend) if backend else cv2.VideoCapture(idx)
                     time.sleep(0.25)
                     if cap.isOpened():
-                        self.cap = cap; print(f"[Camera] abierta (idx={idx}, backend={backend})"); break
+                        self.cap = cap
+                        print(f"[Camera] abierta (idx={idx}, backend={backend})")
+                        break
                     cap.release()
                 except Exception:
                     pass
             if self.cap is None:
-                # Mostrar popup de error después de que la UI haya aparecido para no robar foco inicial
                 self.root.after(300, lambda: (messagebox.showerror('Cámara', 'No se pudo abrir la cámara'), self._refocus_user()))
                 return
         if not self.running:
@@ -413,7 +437,7 @@ class GestureLoginApp:
                 except Exception:
                     pass
             self.root.after(0, upd)
-            time.sleep(1/30)
+            time.sleep(1 / 30)
 
     def stop_camera(self):
         self.running = False
@@ -430,10 +454,30 @@ class GestureLoginApp:
         letterboxed = letterbox_to_512_from_bgr(self.frame)
         png_bytes = pil_to_png_bytes(letterboxed)
         self.last_pred_var.set('...')
+        if self.dev_mode:
+            # Usar imagen RAW para preview (sin letterbox) y rellenar panel completo
+            try:
+                raw_pil = Image.fromarray(cv2.cvtColor(self.frame, cv2.COLOR_BGR2RGB))
+            except Exception:
+                raw_pil = letterboxed
+            self._update_preview(raw_pil)
         threading.Thread(target=self._infer_thread, args=(png_bytes,), daemon=True).start()
 
     def _infer_thread(self, png_bytes: bytes):
-        pred = call_vertex_generate(png_bytes)
+        key = self.selected_model
+        if key == 'local':
+            pred = call_local_model(Image.open(io.BytesIO(png_bytes)))
+        else:
+            if key == 'gemini-2.5-pro-simple':
+                model_name = 'gemini-2.5-pro'
+                system_prompt = SIMPLE_PROMPT
+            elif key == 'gemini-2.5-flash':
+                model_name = 'gemini-2.5-flash'
+                system_prompt = PROMPT
+            else:
+                model_name = 'gemini-2.5-pro'
+                system_prompt = PROMPT
+            pred = call_vertex_generate(png_bytes, model_name=model_name, system_prompt=system_prompt)
         if pred is None:
             pred = 'NOTHING'
         if pred and pred != 'NOTHING':
@@ -447,6 +491,55 @@ class GestureLoginApp:
             self.password_var.set(cur)
         self.root.after(0, lambda: self.last_pred_var.set(pred))
 
+    def toggle_dev_mode(self, force: Optional[bool] = None):
+        new_state = (not self.dev_mode) if force is None else force
+        if new_state == self.dev_mode:
+            return
+        self.dev_mode = new_state
+        if self.dev_mode:
+            if not self.preview_holder.winfo_manager():
+                self.preview_holder.pack(side=tk.TOP, pady=(18, 0))
+            self.dev_card.grid(row=1, column=1, sticky='n', padx=6, pady=(25, 10))
+            self.dev_toggle_btn.config(relief=tk.SUNKEN, bg=ACCENT, fg='white')
+        else:
+            self.dev_card.grid_forget()
+            try:
+                if self.preview_holder.winfo_manager():
+                    self.preview_holder.pack_forget()
+            except Exception:
+                pass
+            self.dev_toggle_btn.config(relief=tk.RAISED, bg=self.root.cget('bg'), fg='black')
+
+    def _update_preview(self, pil_img: Image.Image):
+        try:
+            target_w, target_h = self.cam_size
+            im = pil_img.copy()
+
+            # Llenar completamente recortando sobrante
+            ratio = max(target_w / im.width, target_h / im.height)
+            new_w, new_h = int(im.width * ratio), int(im.height * ratio)
+            if (new_w, new_h) != (im.width, im.height):
+                im = im.resize((new_w, new_h), Image.LANCZOS)
+            left = max(0, (new_w - target_w) // 2)
+            top = max(0, (new_h - target_h) // 2)
+            im = im.crop((left, top, left + target_w, top + target_h))
+            imgtk = ImageTk.PhotoImage(im)
+            self.preview_label.config(image=imgtk, text='')
+            self.preview_label.imgtk = imgtk
+        except Exception:
+            pass
+
+    def select_model(self, key: str):
+        self.selected_model = key
+        self._refresh_model_buttons()
+
+    def _refresh_model_buttons(self):
+        for k, btn in getattr(self, 'model_buttons', {}).items():
+            if k == self.selected_model:
+                btn.config(bg=ACCENT, fg='white', relief=tk.SUNKEN)
+            else:
+                btn.config(bg='#e6e6e6', fg='black', relief=tk.RAISED)
+
     def login(self):
         user = self.username_var.get().strip()
         pwd = self.password_var.get()
@@ -455,13 +548,22 @@ class GestureLoginApp:
         if not pwd:
             messagebox.showwarning('Login', 'No hay contraseña'); return
         origen = 'gestos' if self.mode == 'GESTOS' else 'texto'
-        messagebox.showinfo('Login', f'Usuario: {user}\nPassword: {"*"*len(pwd)}\n(Método: {origen} – simulación)')
+        stars = '*' * len(pwd)
+        messagebox.showinfo('Login', f'Usuario: {user}\nPassword: {stars}\n(Método: {origen} – simulación)')
+
+    def _refocus_user(self):
+        try:
+            self.username_entry.focus_set()
+        except Exception:
+            pass
 
     def quit(self):
         self.running = False
         if self.cap:
-            try: self.cap.release()
-            except Exception: pass
+            try:
+                self.cap.release()
+            except Exception:
+                pass
             self.cap = None
         try:
             self.root.destroy()
