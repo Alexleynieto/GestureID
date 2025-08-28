@@ -3,6 +3,7 @@ import io
 import json
 import threading
 import time
+import os
 from typing import Optional
 
 import cv2
@@ -14,6 +15,19 @@ from tkinter import ttk, messagebox
 import requests
 import google.auth
 from google.auth.transport.requests import Request
+
+
+# --------- Opcional (cargados perezosamente) ---------
+LOCAL_MLP_MODEL = None
+LOCAL_MLP_INPUT_DIM = None
+LOCAL_LABELS = None
+MP_HANDS_CTX = None
+LOCAL_MODEL_PATH = "modelo_ASL_MLP_Landmarks.h5"
+LOCAL_MIN_CONF = 0.70
+LOCAL_SMOOTHING = 3
+
+# Buffer circular para suavizado
+_local_pred_buffer = []
 
 # ----------------- Config -----------------
 PROJECT_ID = "gestureid"
@@ -203,8 +217,207 @@ def call_vertex_generate(png_bytes: bytes, model_name: Optional[str] = None, sys
     return normalize_gesture(dumped)
 
 
-def call_local_model(pil_img: Image.Image) -> Optional[str]:
-    return "NOTHING"
+def _lazy_load_local_dependencies():
+    """Carga perezosa TensorFlow, MediaPipe y el modelo MLP entrenado."""
+    global LOCAL_MLP_MODEL, LOCAL_MLP_INPUT_DIM, LOCAL_LABELS, MP_HANDS_CTX
+    if LOCAL_MLP_MODEL is not None and MP_HANDS_CTX is not None:
+        return True
+    try:
+        import tensorflow as tf  # noqa: F401
+    except Exception as e:
+        print(f"[LocalModel] TensorFlow no disponible: {e}")
+        return False
+    try:
+        import mediapipe as mp  # noqa: F401
+    except Exception as e:
+        print(f"[LocalModel] MediaPipe no disponible: {e}")
+        return False
+    # Cargar modelo
+    try:
+        from tensorflow import keras  # type: ignore
+        load_error = None
+        # 1. Intentar carga simple (MLP estándar)
+        try:
+            LOCAL_MLP_MODEL = keras.models.load_model(LOCAL_MODEL_PATH, compile=False)
+        except Exception as e_simple:
+            load_error = e_simple
+            # 2. Fallback: registrar capas GCN solo si realmente se requiere
+            try:
+                import tensorflow as tf
+                NUM_LANDMARKS = 21
+                connections = [
+                    (0, 1), (1, 2), (2, 3), (3, 4),
+                    (0, 5), (5, 6), (6, 7), (7, 8),
+                    (0, 9), (9, 10), (10, 11), (11, 12),
+                    (0, 13), (13, 14), (14, 15), (15, 16),
+                    (0, 17), (17, 18), (18, 19), (19, 20),
+                    (5, 9), (9, 13), (13, 17)
+                ]
+                A = np.zeros((NUM_LANDMARKS, NUM_LANDMARKS), dtype=np.float32)
+                for i, j in connections:
+                    A[i, j] = 1; A[j, i] = 1
+                A += np.eye(NUM_LANDMARKS, dtype=np.float32)
+                D = np.diag(np.sum(A, axis=1)); D_inv_sqrt = np.linalg.inv(np.sqrt(D)); norm_adj = D_inv_sqrt @ A @ D_inv_sqrt
+                NORM_ADJ_TF = tf.constant(norm_adj, dtype=tf.float32)
+                class GraphConvLayer(keras.layers.Layer):
+                    def __init__(self, units, **kwargs):
+                        super().__init__(**kwargs); self.units = units
+                    def build(self, input_shape):
+                        in_dim = int(input_shape[-1])
+                        self.w = self.add_weight(name='w', shape=(in_dim, self.units), initializer='glorot_uniform', trainable=True)
+                        super().build(input_shape)
+                    def call(self, inputs):
+                        xw = tf.matmul(inputs, self.w)
+                        return tf.matmul(tf.expand_dims(NORM_ADJ_TF, 0), xw)
+                    def get_config(self):
+                        c = super().get_config(); c.update({'units': self.units}); return c
+                class AttentionLayer(keras.layers.Layer):
+                    def __init__(self, units, **kwargs):
+                        super().__init__(**kwargs); self.units = units
+                    def build(self, input_shape):
+                        self.q_dense = keras.layers.Dense(self.units, activation='tanh')
+                        self.k_dense = keras.layers.Dense(self.units, activation='softmax')
+                        super().build(input_shape)
+                    def call(self, inputs):
+                        q = self.q_dense(inputs); att = self.k_dense(q)
+                        if att.shape[-1] != inputs.shape[-1]:
+                            if not hasattr(self, 'proj'):
+                                self.proj = keras.layers.Dense(inputs.shape[-1], activation=None, use_bias=False)
+                            att = self.proj(att)
+                        return inputs * att
+                    def get_config(self):
+                        c = super().get_config(); c.update({'units': self.units}); return c
+                LOCAL_MLP_MODEL = keras.models.load_model(LOCAL_MODEL_PATH, custom_objects={
+                    'GraphConvLayer': GraphConvLayer,
+                    'AttentionLayer': AttentionLayer
+                }, compile=False)
+                print(f"[LocalModel] Cargado con capas GCN tras fallback. Error previo: {load_error}")
+            except Exception as e_fallback:
+                print(f"[LocalModel] No se pudo cargar el modelo (intentado simple y fallback): {e_fallback}\nOriginal: {load_error}")
+                LOCAL_MLP_MODEL = None
+                return False
+        # Determinar input dim (primera dimensión de features)
+        try:
+            LOCAL_MLP_INPUT_DIM = LOCAL_MLP_MODEL.input_shape[1]
+        except Exception:
+            # fallback: intentar inferir desde capas
+            try:
+                LOCAL_MLP_INPUT_DIM = LOCAL_MLP_MODEL.layers[0].input_shape[-1]
+            except Exception:
+                LOCAL_MLP_INPUT_DIM = None
+        print(f"[LocalModel] Modelo cargado '{LOCAL_MODEL_PATH}' (input_dim={LOCAL_MLP_INPUT_DIM})")
+        # Fijar orden exacto de etiquetas proporcionado por el usuario
+        LOCAL_LABELS = [
+            'A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z',
+            'DEL','NOTHING','SPACE'
+        ]
+        print(f"[LocalModel] Etiquetas hardcoded ({len(LOCAL_LABELS)})")
+        # Validar output vs etiquetas
+        try:
+            out_units = LOCAL_MLP_MODEL.output_shape[-1]
+            if out_units != len(LOCAL_LABELS):
+                print(f"[LocalModel][WARN] output_units={out_units} != num_labels={len(LOCAL_LABELS)}")
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[LocalModel] No se pudo cargar el modelo '{LOCAL_MODEL_PATH}': {e}")
+        LOCAL_MLP_MODEL = None
+        return False
+    # Crear contexto de manos
+    try:
+        import mediapipe as mp
+        MP_HANDS_CTX = mp.solutions.hands.Hands(static_image_mode=False, max_num_hands=1, model_complexity=1,
+                                               min_detection_confidence=0.5, min_tracking_confidence=0.5)
+    except Exception as e:
+        print(f"[LocalModel] Error iniciando MediaPipe Hands: {e}")
+        MP_HANDS_CTX = None
+        return False
+    return True
+
+
+def _extract_hand_landmarks(frame_bgr) -> Optional[np.ndarray]:
+    """Extrae vector de características desde frame BGR usando MediaPipe.
+
+    Intenta adaptarse a la dimensión requerida por el MLP:
+    - Si input_dim == 63 => usa (x,y,z) * 21 landmarks
+    - Si input_dim == 42 => usa (x,y) * 21 landmarks
+    - Si input_dim >= 63 y no es múltiplo exacto, rellena con ceros
+    """
+    global MP_HANDS_CTX, LOCAL_MLP_INPUT_DIM
+    if MP_HANDS_CTX is None:
+        return None
+    
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    res = MP_HANDS_CTX.process(rgb)
+    if not res.multi_hand_landmarks:
+        return None
+    hand = res.multi_hand_landmarks[0]
+    coords = []
+    for lm in hand.landmark:
+        coords.extend([lm.x, lm.y, lm.z])
+    vec = np.array(coords, dtype='float32')  # 63
+    if LOCAL_MLP_INPUT_DIM is None:
+        return None
+    if LOCAL_MLP_INPUT_DIM == vec.shape[0]:
+        return vec
+    if LOCAL_MLP_INPUT_DIM == 42:  # solo x,y
+        xy = []
+        for i in range(0, len(coords), 3):
+            xy.extend(coords[i:i + 2])
+        return np.array(xy, dtype='float32')
+    
+    # Si mayor, rellenar
+    if LOCAL_MLP_INPUT_DIM > vec.shape[0]:
+        pad = np.zeros((LOCAL_MLP_INPUT_DIM - vec.shape[0],), dtype='float32')
+        return np.concatenate([vec, pad])
+
+    # Si menor, recortar
+    return vec[:LOCAL_MLP_INPUT_DIM]
+
+
+def call_local_model_from_frame(frame_bgr: np.ndarray) -> Optional[str]:
+    """Pipeline completo de inferencia local desde frame BGR."""
+    global LOCAL_MLP_MODEL, LOCAL_LABELS, _local_pred_buffer
+
+    if frame_bgr is None:
+        return None
+    
+    if not _lazy_load_local_dependencies():
+        return None
+    feats = _extract_hand_landmarks(frame_bgr)
+
+    if feats is None:
+        return "NOTHING"
+
+    try:
+        feats = feats.reshape(1, -1)
+        preds = LOCAL_MLP_MODEL.predict(feats, verbose=0)[0]
+        idx = int(np.argmax(preds))
+        prob = float(preds[idx])
+        if idx >= len(LOCAL_LABELS):
+            return "NOTHING"
+        raw_label = LOCAL_LABELS[idx]
+        # Map a tokens estandarizados
+        if raw_label == 'del':
+            token = 'DEL'
+        elif raw_label == 'space':
+            token = 'SPACE'
+        elif raw_label == 'nothing':
+            token = 'NOTHING'
+        else:
+            token = raw_label.upper()
+        if prob < LOCAL_MIN_CONF:
+            token = 'NOTHING'
+        # Suavizado simple por voto mayoritario en ventana
+        _local_pred_buffer.append(token)
+        if len(_local_pred_buffer) > LOCAL_SMOOTHING:
+            _local_pred_buffer = _local_pred_buffer[-LOCAL_SMOOTHING:]
+        vals, counts = np.unique(_local_pred_buffer, return_counts=True)
+        smooth_token = vals[int(np.argmax(counts))]
+        return smooth_token
+    except Exception as e:
+        print(f"[LocalModel] Error durante la inferencia: {e}")
+        return None
 
 
 class GestureLoginApp:
@@ -232,7 +445,7 @@ class GestureLoginApp:
         self.last_pred_var = tk.StringVar(value='-')
         self.dev_mode = False
         self.selected_model = MODEL_NAME
-        # Tamaño de paneles (cámara y preview) reducido para 1080p
+
         self.cam_size = (640, 480)
 
         self.build_ui()
@@ -455,18 +668,30 @@ class GestureLoginApp:
         png_bytes = pil_to_png_bytes(letterboxed)
         self.last_pred_var.set('...')
         if self.dev_mode:
-            # Usar imagen RAW para preview (sin letterbox) y rellenar panel completo
-            try:
-                raw_pil = Image.fromarray(cv2.cvtColor(self.frame, cv2.COLOR_BGR2RGB))
-            except Exception:
-                raw_pil = letterboxed
-            self._update_preview(raw_pil)
+            # Si es modelo local, intentar dibujar landmarks
+            if self.selected_model == 'local':
+                pil_with_lm = self._make_landmark_preview(self.frame) or Image.fromarray(cv2.cvtColor(self.frame, cv2.COLOR_BGR2RGB))
+                self._update_preview(pil_with_lm)
+            else:
+                # Usar imagen RAW para preview (sin letterbox) y rellenar panel completo
+                try:
+                    raw_pil = Image.fromarray(cv2.cvtColor(self.frame, cv2.COLOR_BGR2RGB))
+                except Exception:
+                    raw_pil = letterboxed
+                self._update_preview(raw_pil)
         threading.Thread(target=self._infer_thread, args=(png_bytes,), daemon=True).start()
 
     def _infer_thread(self, png_bytes: bytes):
         key = self.selected_model
         if key == 'local':
-            pred = call_local_model(Image.open(io.BytesIO(png_bytes)))
+            # Usar frame original para landmarks
+            frame_copy = None
+            try:
+                if self.frame is not None:
+                    frame_copy = self.frame.copy()
+            except Exception:
+                pass
+            pred = call_local_model_from_frame(frame_copy) if frame_copy is not None else 'NOTHING'
         else:
             if key == 'gemini-2.5-pro-simple':
                 model_name = 'gemini-2.5-pro'
@@ -499,8 +724,7 @@ class GestureLoginApp:
         if self.dev_mode:
             if not self.preview_holder.winfo_manager():
                 self.preview_holder.pack(side=tk.TOP, pady=(18, 0))
-            # Dev card más arriba (menor padding superior)
-            self.dev_card.grid(row=1, column=1, sticky='n', padx=6, pady=(15, 10))
+            self.dev_card.grid(row=1, column=1, sticky='n', padx=6, pady=(25, 10))
             self.dev_toggle_btn.config(relief=tk.SUNKEN, bg=ACCENT, fg='white')
         else:
             self.dev_card.grid_forget()
@@ -529,6 +753,43 @@ class GestureLoginApp:
             self.preview_label.imgtk = imgtk
         except Exception:
             pass
+
+    def _make_landmark_preview(self, frame_bgr) -> Optional[Image.Image]:
+        """Genera una imagen PIL con landmarks dibujados (si MediaPipe está disponible)."""
+        try:
+            if frame_bgr is None:
+                return None
+            # Asegurar dependencias cargadas
+            if not _lazy_load_local_dependencies():
+                return None
+            import mediapipe as mp  # import local para no fallar si falta
+            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            res = MP_HANDS_CTX.process(rgb)
+            if not res.multi_hand_landmarks:
+                return Image.fromarray(rgb)
+            annotated = rgb.copy()
+            # Intentar usar drawing_utils si existe
+            try:
+                from mediapipe.python.solutions import drawing_utils as du
+                for hand_landmarks in res.multi_hand_landmarks:
+                    du.draw_landmarks(
+                        annotated,
+                        hand_landmarks,
+                        mp.solutions.hands.HAND_CONNECTIONS,
+                        landmark_drawing_spec=du.DrawingSpec(color=(0,255,0), thickness=2, circle_radius=3),
+                        connection_drawing_spec=du.DrawingSpec(color=(255,140,0), thickness=2, circle_radius=2)
+                    )
+            except Exception:
+                # Fallback simple
+                hand = res.multi_hand_landmarks[0]
+                h, w = annotated.shape[:2]
+                for lm in hand.landmark:
+                    x, y = int(lm.x * w), int(lm.y * h)
+                    cv2.circle(annotated, (x, y), 4, (0, 255, 0), -1)
+            return Image.fromarray(annotated)
+        except Exception as e:
+            print(f"[LocalModel] Error generando preview landmarks: {e}")
+            return None
 
     def select_model(self, key: str):
         self.selected_model = key
