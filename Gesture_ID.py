@@ -232,8 +232,8 @@ class GestureLoginApp:
         self.last_pred_var = tk.StringVar(value='-')
         self.dev_mode = False
         self.selected_model = MODEL_NAME
-
-        self.cam_size = (800, 600)
+        # Tamaño de paneles (cámara y preview) reducido para 1080p
+        self.cam_size = (640, 480)
 
         self.build_ui()
         self._bind_space()
@@ -499,7 +499,8 @@ class GestureLoginApp:
         if self.dev_mode:
             if not self.preview_holder.winfo_manager():
                 self.preview_holder.pack(side=tk.TOP, pady=(18, 0))
-            self.dev_card.grid(row=1, column=1, sticky='n', padx=6, pady=(25, 10))
+            # Dev card más arriba (menor padding superior)
+            self.dev_card.grid(row=1, column=1, sticky='n', padx=6, pady=(15, 10))
             self.dev_toggle_btn.config(relief=tk.SUNKEN, bg=ACCENT, fg='white')
         else:
             self.dev_card.grid_forget()
